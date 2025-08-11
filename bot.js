@@ -1,4 +1,4 @@
-// bot.js  (CommonJS)
+// bot.js
 require('dotenv').config();
 const axios = require('axios');
 const express = require('express');
@@ -12,9 +12,8 @@ const STAKE_KEYS = (process.env.STAKE_KEYS || '').split(',').map(k => k.trim()).
 const POLICY_IDS = (process.env.POLICY_IDS || '').split(',').map(p => p.trim()).filter(Boolean);
 const PORT = process.env.PORT || 3000;
 
-// Pool.pm NFT CDN preview
-const PREVIEW_TOKEN = process.env.NFTCDN_TOKEN || 'svLsONnd66U1588Y2h5fsIdsIVU4BStGvIGdqwGw3Jw';
-const PREVIEW_SIZE = parseInt(process.env.NFTCDN_SIZE || '512', 10); // 256/512/1024 etc.
+// Pool.pm NFT CDN token (use yours here)
+const POOLPM_TOKEN = process.env.POOLPM_TOKEN || 'TbEYPtwVVAv_d-d9so7GIs2myJ7o4CITRNEh09NFBPE';
 
 // === CONSTANTS ===
 const EXTRA_MONITORED_ADDRESS = 'addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx';
@@ -23,6 +22,11 @@ const MAX_PAGES = 5;
 const CHECK_INTERVAL = 180000; // 3 minutes
 const CARDANO_GENESIS_TIME = 1506203091;
 const EPOCH_DURATION = 432000;
+
+if (!DISCORD_BOT_TOKEN || !DISCORD_CHANNEL_ID || !BLOCKFROST_API_KEY) {
+  console.error('❌ Missing env vars: DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, BLOCKFROST_API_KEY');
+  process.exit(1);
+}
 
 const app = express();
 const client = new Client({
@@ -56,79 +60,31 @@ async function getTransactionBlockTime(txHash) {
   }
 }
 
-/** ---------- IMAGE: extract + pool.pm preview builder ---------- **/
+/** ---------- Pool.pm image helpers (fingerprint-based) ---------- **/
 
-function extractRawImage(meta) {
-  if (!meta || typeof meta !== 'object') return null;
-
-  // Try common fields (handles arrays/objects)
-  const candidates = [
-    meta.image,
-    meta.image_url,
-    meta.thumbnail,
-    meta.media,
-    Array.isArray(meta.files)
-      ? meta.files.find(f => /image\//i.test(f?.mediaType || f?.mimeType))?.src
-      : null,
-    Array.isArray(meta.files)
-      ? meta.files.find(f => /image\//i.test(f?.mediaType || f?.mimeType))?.url
-      : null,
-  ].flat().filter(Boolean);
-
-  let raw = candidates.find(v =>
-    typeof v === 'string' || (v && typeof v === 'object' && typeof v.url === 'string')
-  );
-  if (!raw) return null;
-  if (typeof raw === 'object' && raw.url) raw = raw.url;
-  return typeof raw === 'string' ? raw.split('#')[0] : null; // strip fragments
+function poolpmFileUrl(fingerprint, index = 0) {
+  // e.g. https://asset14...poolpm.nftcdn.io/files/0/?tk=TOKEN
+  return `https://${fingerprint}.poolpm.nftcdn.io/files/${index}/?tk=${POOLPM_TOKEN}`;
 }
 
-/**
- * Build Pool.pm NFT CDN preview URL from any original URL:
- * - accepts ipfs://CID[/path], /ipfs/CID[/path], ar://<id>, or https://...
- * - we just pass the original url (normalized to a canonical scheme) to the 'url' param
- *   and let nftcdn render a small, Discord-friendly image.
- */
-function normalizeToCanonicalUrl(raw) {
-  if (!raw) return null;
-
-  // Already http(s) or data URLs -> use as-is
-  if (/^https?:\/\//i.test(raw) || /^data:image\//i.test(raw)) return raw;
-
-  // arweave
-  if (/^ar:\/\//i.test(raw)) {
-    const id = raw.replace(/^ar:\/\//i, '');
-    return `https://arweave.net/${id}`;
+// Try /files/0, /files/1, /files/2, ... until one returns an image content-type
+async function resolvePoolpmImageByFingerprint(fingerprint, maxTries = 3) {
+  for (let i = 0; i < maxTries; i++) {
+    const url = poolpmFileUrl(fingerprint, i);
+    try {
+      const head = await axios.head(url, { timeout: 5000, validateStatus: s => s < 500 });
+      const ct = String(head.headers['content-type'] || '');
+      if (head.status >= 200 && head.status < 400 && /image\//i.test(ct)) {
+        return url;
+      }
+    } catch (_) {
+      // try next index
+    }
   }
-
-  // ipfs variants -> normalize to ipfs://CID/path (canonical)
-  const m =
-    raw.match(/^ipfs:\/\/ipfs\/([^/]+)(.*)?$/i) ||
-    raw.match(/^ipfs:\/\/([^/]+)(.*)?$/i) ||
-    raw.match(/^\/ipfs\/([^/]+)(.*)?$/i);
-
-  if (m) {
-    const cid = m[1];
-    const rest = m[2] || '';
-    return `ipfs://${cid}${rest}`;
-  }
-
-  return raw; // fallback: pass whatever it is; nftcdn may still handle it
+  return null;
 }
 
-function buildPoolPreviewUrl(raw) {
-  const canonical = normalizeToCanonicalUrl(raw);
-  if (!canonical) return null;
-  const base = 'https://nftcdn.io/preview';
-  const params = new URLSearchParams({
-    size: String(PREVIEW_SIZE),
-    tk: PREVIEW_TOKEN,
-    url: canonical
-  });
-  return `${base}?${params.toString()}`;
-}
-
-/** ---------------------------------------------------------------- **/
+/** -------------------------------------------------------------- **/
 
 async function resolveAddressesFromStakeKeys() {
   monitoredAddresses = [];
@@ -196,26 +152,27 @@ async function monitorListings() {
       // const finalEpoch = getEpoch(blockTime);
       // if (finalEpoch < 573) { processedTxs.add(tx.tx_hash); continue; }
 
-      const matchingAssets = [];
+      const matchingUnits = [];
       for (const output of utxoRes.data.outputs) {
         if (output.address !== address) continue; // incoming to this monitored address
-        for (const asset of output.amount) {
-          if (asset.unit === 'lovelace') continue;
-          const policyId = asset.unit.slice(0, 56);
-          if (POLICY_IDS.includes(policyId)) matchingAssets.push(asset.unit);
+        for (const amt of output.amount) {
+          if (amt.unit === 'lovelace') continue;
+          const policyId = amt.unit.slice(0, 56);
+          if (POLICY_IDS.includes(policyId)) matchingUnits.push(amt.unit);
         }
       }
 
-      if (matchingAssets.length > 0) {
+      if (matchingUnits.length > 0) {
+        // fetch each asset's metadata + fingerprint
         const assetDetails = await Promise.all(
-          matchingAssets.map(async unit => {
+          matchingUnits.map(async unit => {
             await sleep(250);
             try {
               const res = await axios.get(
                 `https://cardano-mainnet.blockfrost.io/api/v0/assets/${unit}`,
                 { headers: { project_id: BLOCKFROST_API_KEY } }
               );
-              return res.data;
+              return res.data; // contains .fingerprint and .onchain_metadata
             } catch (err) {
               console.error(`Error fetching asset ${unit}:`, err.response?.data || err.message);
               return null;
@@ -230,25 +187,28 @@ async function monitorListings() {
             meta.Asset ||
             (data.asset_name ? Buffer.from(data.asset_name, 'hex').toString() : 'Unknown');
 
+          // Pool.pm image by fingerprint
+          let imageUrl = null;
+          if (data.fingerprint) {
+            imageUrl = await resolvePoolpmImageByFingerprint(data.fingerprint, 4);
+          }
+          // Fallback placeholder if none of the /files/<i> are images
+          if (!imageUrl) imageUrl = 'https://via.placeholder.com/600x400?text=No+Image';
+
           const price = meta.price ? `${(meta.price / 1_000_000).toFixed(2)} ADA` : 'N/A';
-
-          // Build Pool.pm preview image
-          const raw = extractRawImage(meta);
-          const imageUrl = buildPoolPreviewUrl(raw) || 'https://via.placeholder.com/600x400?text=No+Image';
-
           const jpgUrl = `https://www.jpg.store/asset/${data.asset}`;
 
           const embed = new EmbedBuilder()
-            .setTitle(`🛒 New Listing Detected`)
+            .setTitle(`🛒 New Listing Detected Mfer`)
             .setDescription(`**${assetName}**\nPrice: ${price}`)
             .setURL(jpgUrl)
             .setImage(imageUrl)
             .setColor(0x00cc99)
-            .setFooter({ text: 'Policy Monitor' })
+            .setFooter({ text: 'DEEZ Bot Policy Monitor - Buy that Bill' })
             .setTimestamp();
 
           try {
-            console.log({ asset: data.asset, rawImage: raw, preview: imageUrl });
+            console.log({ asset: data.asset, fingerprint: data.fingerprint, imageUrl });
             const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
             await channel.send({ embeds: [embed] });
             console.log(`✅ Sent embed for ${assetName}`);
@@ -269,7 +229,7 @@ client.once('ready', async () => {
   await resolveAddressesFromStakeKeys();
   try {
     const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
-    await channel.send('✅ Bot is now monitoring listings...');
+    await channel.send('✅ DEEZ Bot is now monitoring listings of the Core-Collection...');
   } catch (err) {
     console.error('❌ Failed to send startup message:', err.message);
   }

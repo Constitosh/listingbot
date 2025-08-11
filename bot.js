@@ -160,7 +160,16 @@ async function monitorListings() {
           const meta = data.onchain_metadata || {};
           const assetName = meta.name || meta.Asset || Buffer.from(data.asset_name || '', 'hex').toString() || 'Unknown';
           const price = meta.price ? `${(meta.price / 1_000_000).toFixed(2)} ADA` : 'N/A';
-          const imageUrl = ipfsToHttp(meta.image || meta.media || (meta.files && meta.files[0]?.src));
+  // replace your imageUrl line with this:
+let rawImage =
+  (Array.isArray(meta.image) ? meta.image[0] : meta.image) ||
+  (meta.image && typeof meta.image === 'object' && meta.image.url) ||
+  meta.media ||
+  (meta.files?.find?.(f => /image\//i.test(f?.mediaType || f?.mimeType))?.src) ||
+  (meta.files?.find?.(f => /image\//i.test(f?.mediaType || f?.mimeType))?.url);
+
+const imageUrl = ipfsToHttp(rawImage) || 'https://via.placeholder.com/600x400?text=No+Image';
+
           const jpgUrl = `https://www.jpg.store/asset/${data.asset}`;
 
           const embed = new EmbedBuilder()

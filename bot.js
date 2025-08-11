@@ -1,3 +1,4 @@
+// bot.js  (CommonJS)
 require('dotenv').config();
 const axios = require('axios');
 const express = require('express');
@@ -10,6 +11,10 @@ const BLOCKFROST_API_KEY = process.env.BLOCKFROST_API_KEY;
 const STAKE_KEYS = (process.env.STAKE_KEYS || '').split(',').map(k => k.trim()).filter(Boolean);
 const POLICY_IDS = (process.env.POLICY_IDS || '').split(',').map(p => p.trim()).filter(Boolean);
 const PORT = process.env.PORT || 3000;
+
+// Pool.pm NFT CDN preview
+const PREVIEW_TOKEN = process.env.NFTCDN_TOKEN || 'svLsONnd66U1588Y2h5fsIdsIVU4BStGvIGdqwGw3Jw';
+const PREVIEW_SIZE = parseInt(process.env.NFTCDN_SIZE || '512', 10); // 256/512/1024 etc.
 
 // === CONSTANTS ===
 const EXTRA_MONITORED_ADDRESS = 'addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx';
@@ -51,21 +56,12 @@ async function getTransactionBlockTime(txHash) {
   }
 }
 
-/** ---------- IMAGE HELPERS (robust + JPG gateway first) ---------- **/
+/** ---------- IMAGE: extract + pool.pm preview builder ---------- **/
 
-// Prefer JPG Store's gateway first, then Cloudflare, then others
-const IPFS_GATEWAYS = [
-  cidPath => `https://ipfs.jpgstore.link/ipfs/${cidPath}`,
-  cidPath => `https://cf-ipfs.com/ipfs/${cidPath}`,
-  cidPath => `https://dweb.link/ipfs/${cidPath}`,
-  cidPath => `https://ipfs.io/ipfs/${cidPath}`,
-  cidPath => `https://gateway.pinata.cloud/ipfs/${cidPath}`,
-];
-
-// Pull a plausible image field from onchain metadata
 function extractRawImage(meta) {
   if (!meta || typeof meta !== 'object') return null;
 
+  // Try common fields (handles arrays/objects)
   const candidates = [
     meta.image,
     meta.image_url,
@@ -82,16 +78,22 @@ function extractRawImage(meta) {
   let raw = candidates.find(v =>
     typeof v === 'string' || (v && typeof v === 'object' && typeof v.url === 'string')
   );
-
   if (!raw) return null;
   if (typeof raw === 'object' && raw.url) raw = raw.url;
   return typeof raw === 'string' ? raw.split('#')[0] : null; // strip fragments
 }
 
-// Convert common ipfs/arweave patterns → first HTTPS candidate (no fetch)
-function toHttpMaybe(raw) {
+/**
+ * Build Pool.pm NFT CDN preview URL from any original URL:
+ * - accepts ipfs://CID[/path], /ipfs/CID[/path], ar://<id>, or https://...
+ * - we just pass the original url (normalized to a canonical scheme) to the 'url' param
+ *   and let nftcdn render a small, Discord-friendly image.
+ */
+function normalizeToCanonicalUrl(raw) {
   if (!raw) return null;
-  if (/^https?:\/\//i.test(raw)) return raw;
+
+  // Already http(s) or data URLs -> use as-is
+  if (/^https?:\/\//i.test(raw) || /^data:image\//i.test(raw)) return raw;
 
   // arweave
   if (/^ar:\/\//i.test(raw)) {
@@ -99,7 +101,7 @@ function toHttpMaybe(raw) {
     return `https://arweave.net/${id}`;
   }
 
-  // ipfs variants: ipfs://CID[/path], ipfs://ipfs/CID[/path], /ipfs/CID[/path]
+  // ipfs variants -> normalize to ipfs://CID/path (canonical)
   const m =
     raw.match(/^ipfs:\/\/ipfs\/([^/]+)(.*)?$/i) ||
     raw.match(/^ipfs:\/\/([^/]+)(.*)?$/i) ||
@@ -108,41 +110,25 @@ function toHttpMaybe(raw) {
   if (m) {
     const cid = m[1];
     const rest = m[2] || '';
-    // Prefer JPG gateway first for Discord reliability
-    return IPFS_GATEWAYS[0](`${cid}${rest}`);
+    return `ipfs://${cid}${rest}`;
   }
 
-  return null;
+  return raw; // fallback: pass whatever it is; nftcdn may still handle it
 }
 
-// Ensure URL is an actual image (HEAD) and rotate gateways if needed
-async function ensureImageUrl(urlOrIpfsish) {
-  const first = toHttpMaybe(urlOrIpfsish) || urlOrIpfsish;
-  if (!first) return null;
-
-  const expandGateways = (u) => {
-    const m = u.match(/\/ipfs\/([^/]+)(.*)?$/i);
-    if (m) return IPFS_GATEWAYS.map(fn => fn(`${m[1]}${m[2] || ''}`));
-    return [u];
-  };
-
-  const candidates = expandGateways(first).filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      const head = await axios.head(candidate, { timeout: 5000, validateStatus: s => s < 500 });
-      const ct = String(head.headers['content-type'] || '');
-      if (head.status >= 200 && head.status < 400 && /image\//i.test(ct)) {
-        return candidate;
-      }
-    } catch (_) {
-      // try next
-    }
-  }
-  return null;
+function buildPoolPreviewUrl(raw) {
+  const canonical = normalizeToCanonicalUrl(raw);
+  if (!canonical) return null;
+  const base = 'https://nftcdn.io/preview';
+  const params = new URLSearchParams({
+    size: String(PREVIEW_SIZE),
+    tk: PREVIEW_TOKEN,
+    url: canonical
+  });
+  return `${base}?${params.toString()}`;
 }
 
-/** ------------------------------------------------------------- **/
+/** ---------------------------------------------------------------- **/
 
 async function resolveAddressesFromStakeKeys() {
   monitoredAddresses = [];
@@ -206,7 +192,7 @@ async function monitorListings() {
         continue;
       }
 
-      // optional epoch filter (disabled by default)
+      // Optional epoch filter:
       // const finalEpoch = getEpoch(blockTime);
       // if (finalEpoch < 573) { processedTxs.add(tx.tx_hash); continue; }
 
@@ -246,9 +232,9 @@ async function monitorListings() {
 
           const price = meta.price ? `${(meta.price / 1_000_000).toFixed(2)} ADA` : 'N/A';
 
-          // Use the raw image (e.g., 'ipfs://Qm...') and produce a Discord-safe URL
+          // Build Pool.pm preview image
           const raw = extractRawImage(meta);
-          const imageUrl = (await ensureImageUrl(raw)) || 'https://via.placeholder.com/600x400?text=No+Image';
+          const imageUrl = buildPoolPreviewUrl(raw) || 'https://via.placeholder.com/600x400?text=No+Image';
 
           const jpgUrl = `https://www.jpg.store/asset/${data.asset}`;
 
@@ -262,7 +248,7 @@ async function monitorListings() {
             .setTimestamp();
 
           try {
-            console.log({ asset: data.asset, rawImage: raw, imageUrl });
+            console.log({ asset: data.asset, rawImage: raw, preview: imageUrl });
             const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
             await channel.send({ embeds: [embed] });
             console.log(`✅ Sent embed for ${assetName}`);

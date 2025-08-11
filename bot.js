@@ -7,8 +7,8 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 const BLOCKFROST_API_KEY = process.env.BLOCKFROST_API_KEY;
-const STAKE_KEYS = (process.env.STAKE_KEYS || '').split(',').map(k => k.trim());
-const POLICY_IDS = (process.env.POLICY_IDS || '').split(',').map(p => p.trim());
+const STAKE_KEYS = (process.env.STAKE_KEYS || '').split(',').map(k => k.trim()).filter(Boolean);
+const POLICY_IDS = (process.env.POLICY_IDS || '').split(',').map(p => p.trim()).filter(Boolean);
 const PORT = process.env.PORT || 3000;
 
 // === CONSTANTS ===
@@ -16,7 +16,6 @@ const EXTRA_MONITORED_ADDRESS = 'addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v
 const TX_FETCH_LIMIT = 100;
 const MAX_PAGES = 5;
 const CHECK_INTERVAL = 180000; // 3 minutes
-const EPOCH_573_START_TIME = 1753739091;
 const CARDANO_GENESIS_TIME = 1506203091;
 const EPOCH_DURATION = 432000;
 
@@ -35,18 +34,6 @@ app.listen(PORT, () => console.log(`✨ Web server running on port ${PORT}`));
 // === UTILS ===
 const sleep = ms => new Promise(res => setTimeout(res, ms));
 
-function ipfsToHttp(ipfs) {
-  if (!ipfs) return 'https://via.placeholder.com/150?text=No+Image';
-  if (Array.isArray(ipfs)) ipfs = ipfs[0];
-  else if (typeof ipfs === 'object' && ipfs.url) ipfs = ipfs.url;
-  if (typeof ipfs !== 'string') return 'https://via.placeholder.com/150?text=Invalid+Image';
-
-  if (ipfs.startsWith('ipfs://')) return ipfs.replace('ipfs://', 'https://ipfs.io/ipfs/');
-  if (ipfs.startsWith('http')) return ipfs;
-
-  return 'https://via.placeholder.com/150?text=Unknown+Format';
-}
-
 function getEpoch(blockTime) {
   if (!blockTime) return NaN;
   return Math.floor((blockTime - CARDANO_GENESIS_TIME) / EPOCH_DURATION);
@@ -64,6 +51,97 @@ async function getTransactionBlockTime(txHash) {
   }
 }
 
+/** ---------- IMAGE HELPERS (robust for Discord) ---------- **/
+
+// Prefer Cloudflare first; rotate if needed
+const IPFS_GATEWAYS = [
+  cidPath => `https://cf-ipfs.com/ipfs/${cidPath}`,
+  cidPath => `https://dweb.link/ipfs/${cidPath}`,
+  cidPath => `https://ipfs.io/ipfs/${cidPath}`,
+  cidPath => `https://gateway.pinata.cloud/ipfs/${cidPath}`,
+];
+
+// Pull a plausible image field from onchain metadata
+function extractRawImage(meta) {
+  if (!meta || typeof meta !== 'object') return null;
+
+  const candidates = [
+    meta.image,
+    meta.image_url,
+    meta.thumbnail,
+    meta.media,
+    Array.isArray(meta.files)
+      ? meta.files.find(f => /image\//i.test(f?.mediaType || f?.mimeType))?.src
+      : null,
+    Array.isArray(meta.files)
+      ? meta.files.find(f => /image\//i.test(f?.mediaType || f?.mimeType))?.url
+      : null,
+  ].flat().filter(Boolean);
+
+  let raw = candidates.find(v =>
+    typeof v === 'string' || (v && typeof v === 'object' && typeof v.url === 'string')
+  );
+
+  if (!raw) return null;
+  if (typeof raw === 'object' && raw.url) raw = raw.url;
+  return typeof raw === 'string' ? raw.split('#')[0] : null; // strip fragments
+}
+
+// Convert common ipfs/arweave patterns to an initial https URL (don’t fetch yet)
+function toHttpMaybe(raw) {
+  if (!raw) return null;
+  if (/^https?:\/\//i.test(raw)) return raw;
+
+  // arweave
+  if (/^ar:\/\//i.test(raw)) {
+    const id = raw.replace(/^ar:\/\//i, '');
+    return `https://arweave.net/${id}`;
+  }
+
+  // ipfs variants: ipfs://CID[/path], ipfs://ipfs/CID[/path], /ipfs/CID[/path]
+  const m =
+    raw.match(/^ipfs:\/\/ipfs\/([^/]+)(.*)?$/i) ||
+    raw.match(/^ipfs:\/\/([^/]+)(.*)?$/i) ||
+    raw.match(/^\/ipfs\/([^/]+)(.*)?$/i);
+
+  if (m) {
+    const cid = m[1];
+    const rest = m[2] || '';
+    return IPFS_GATEWAYS[0](`${cid}${rest}`);
+  }
+
+  return null;
+}
+
+// Ensure the URL is actually an image (HEAD) and rotate gateways if needed
+async function ensureImageUrl(urlOrIpfsish) {
+  const first = toHttpMaybe(urlOrIpfsish) || urlOrIpfsish;
+  if (!first) return null;
+
+  const tryGateways = (u) => {
+    const m = u.match(/\/ipfs\/([^/]+)(.*)?$/i);
+    if (m) return IPFS_GATEWAYS.map(fn => fn(`${m[1]}${m[2] || ''}`));
+    return [u];
+  };
+
+  const candidates = tryGateways(first).filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      const head = await axios.head(candidate, { timeout: 5000, validateStatus: s => s < 500 });
+      const ct = String(head.headers['content-type'] || '');
+      if (head.status >= 200 && head.status < 400 && /image\//i.test(ct)) {
+        return candidate;
+      }
+    } catch (_) {
+      // try next candidate
+    }
+  }
+  return null;
+}
+
+/** -------------------------------------------------------- **/
+
 async function resolveAddressesFromStakeKeys() {
   monitoredAddresses = [];
   for (const stakeKey of STAKE_KEYS) {
@@ -79,7 +157,10 @@ async function resolveAddressesFromStakeKeys() {
     }
   }
 
-  monitoredAddresses.push(EXTRA_MONITORED_ADDRESS);
+  // Always include the extra escrow address
+  if (EXTRA_MONITORED_ADDRESS) monitoredAddresses.push(EXTRA_MONITORED_ADDRESS);
+
+  // Deduplicate
   monitoredAddresses = [...new Set(monitoredAddresses)];
   console.log(`📋 Monitoring ${monitoredAddresses.length} addresses.`);
 }
@@ -90,6 +171,7 @@ async function monitorListings() {
   for (const address of monitoredAddresses) {
     let allTxs = [];
 
+    // paginate recent txs for this address
     for (let page = 1; page <= MAX_PAGES; page++) {
       try {
         const res = await axios.get(
@@ -110,8 +192,8 @@ async function monitorListings() {
     }
 
     for (const tx of allTxs) {
-      const epoch = getEpoch(tx.block_time);
-      if (processedTxs.has(tx.tx_hash) || epoch < 573) continue;
+      // avoid dupes & old epochs quickly
+      if (processedTxs.has(tx.tx_hash)) continue;
 
       let blockTime = tx.block_time;
       let utxoRes;
@@ -120,18 +202,20 @@ async function monitorListings() {
           `https://cardano-mainnet.blockfrost.io/api/v0/txs/${tx.tx_hash}/utxos`,
           { headers: { project_id: BLOCKFROST_API_KEY } }
         );
-        blockTime = utxoRes.data.block_time || await getTransactionBlockTime(tx.tx_hash);
+        blockTime = utxoRes.data.block_time || (await getTransactionBlockTime(tx.tx_hash));
       } catch (err) {
         console.error(`Error fetching UTXO:`, err.response?.data || err.message);
         continue;
       }
 
+      // optional epoch filter – keep if you want to ignore very old txs
       const finalEpoch = getEpoch(blockTime);
-      if (finalEpoch < 573) continue;
+      // if (finalEpoch < 573) { processedTxs.add(tx.tx_hash); continue; }
 
       const matchingAssets = [];
       for (const output of utxoRes.data.outputs) {
-        if (output.address !== address) continue;
+        if (output.address !== address) continue; // incoming to this monitored address
+
         for (const asset of output.amount) {
           if (asset.unit === 'lovelace') continue;
           const policyId = asset.unit.slice(0, 56);
@@ -156,19 +240,18 @@ async function monitorListings() {
           })
         );
 
-        for (const data of assetDetails.filter(d => d)) {
+        for (const data of assetDetails.filter(Boolean)) {
           const meta = data.onchain_metadata || {};
-          const assetName = meta.name || meta.Asset || Buffer.from(data.asset_name || '', 'hex').toString() || 'Unknown';
-          const price = meta.price ? `${(meta.price / 1_000_000).toFixed(2)} ADA` : 'N/A';
-  // replace your imageUrl line with this:
-let rawImage =
-  (Array.isArray(meta.image) ? meta.image[0] : meta.image) ||
-  (meta.image && typeof meta.image === 'object' && meta.image.url) ||
-  meta.media ||
-  (meta.files?.find?.(f => /image\//i.test(f?.mediaType || f?.mimeType))?.src) ||
-  (meta.files?.find?.(f => /image\//i.test(f?.mediaType || f?.mimeType))?.url);
+          const assetName =
+            meta.name ||
+            meta.Asset ||
+            (data.asset_name ? Buffer.from(data.asset_name, 'hex').toString() : 'Unknown');
 
-const imageUrl = ipfsToHttp(rawImage) || 'https://via.placeholder.com/600x400?text=No+Image';
+          const price = meta.price ? `${(meta.price / 1_000_000).toFixed(2)} ADA` : 'N/A';
+
+          // NEW: robust image resolution + gateway rotation
+          const raw = extractRawImage(meta);
+          const imageUrl = (await ensureImageUrl(raw)) || 'https://via.placeholder.com/600x400?text=No+Image';
 
           const jpgUrl = `https://www.jpg.store/asset/${data.asset}`;
 
@@ -182,6 +265,9 @@ const imageUrl = ipfsToHttp(rawImage) || 'https://via.placeholder.com/600x400?te
             .setTimestamp();
 
           try {
+            // Optional: log to verify
+            console.log({ asset: data.asset, rawImage: raw, imageUrl });
+
             const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
             await channel.send({ embeds: [embed] });
             console.log(`✅ Sent embed for ${assetName}`);

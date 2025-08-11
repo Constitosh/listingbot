@@ -51,10 +51,11 @@ async function getTransactionBlockTime(txHash) {
   }
 }
 
-/** ---------- IMAGE HELPERS (robust for Discord) ---------- **/
+/** ---------- IMAGE HELPERS (robust + JPG gateway first) ---------- **/
 
-// Prefer Cloudflare first; rotate if needed
+// Prefer JPG Store's gateway first, then Cloudflare, then others
 const IPFS_GATEWAYS = [
+  cidPath => `https://ipfs.jpgstore.link/ipfs/${cidPath}`,
   cidPath => `https://cf-ipfs.com/ipfs/${cidPath}`,
   cidPath => `https://dweb.link/ipfs/${cidPath}`,
   cidPath => `https://ipfs.io/ipfs/${cidPath}`,
@@ -87,7 +88,7 @@ function extractRawImage(meta) {
   return typeof raw === 'string' ? raw.split('#')[0] : null; // strip fragments
 }
 
-// Convert common ipfs/arweave patterns to an initial https URL (don’t fetch yet)
+// Convert common ipfs/arweave patterns → first HTTPS candidate (no fetch)
 function toHttpMaybe(raw) {
   if (!raw) return null;
   if (/^https?:\/\//i.test(raw)) return raw;
@@ -107,24 +108,25 @@ function toHttpMaybe(raw) {
   if (m) {
     const cid = m[1];
     const rest = m[2] || '';
+    // Prefer JPG gateway first for Discord reliability
     return IPFS_GATEWAYS[0](`${cid}${rest}`);
   }
 
   return null;
 }
 
-// Ensure the URL is actually an image (HEAD) and rotate gateways if needed
+// Ensure URL is an actual image (HEAD) and rotate gateways if needed
 async function ensureImageUrl(urlOrIpfsish) {
   const first = toHttpMaybe(urlOrIpfsish) || urlOrIpfsish;
   if (!first) return null;
 
-  const tryGateways = (u) => {
+  const expandGateways = (u) => {
     const m = u.match(/\/ipfs\/([^/]+)(.*)?$/i);
     if (m) return IPFS_GATEWAYS.map(fn => fn(`${m[1]}${m[2] || ''}`));
     return [u];
   };
 
-  const candidates = tryGateways(first).filter(Boolean);
+  const candidates = expandGateways(first).filter(Boolean);
 
   for (const candidate of candidates) {
     try {
@@ -134,13 +136,13 @@ async function ensureImageUrl(urlOrIpfsish) {
         return candidate;
       }
     } catch (_) {
-      // try next candidate
+      // try next
     }
   }
   return null;
 }
 
-/** -------------------------------------------------------- **/
+/** ------------------------------------------------------------- **/
 
 async function resolveAddressesFromStakeKeys() {
   monitoredAddresses = [];
@@ -157,10 +159,7 @@ async function resolveAddressesFromStakeKeys() {
     }
   }
 
-  // Always include the extra escrow address
   if (EXTRA_MONITORED_ADDRESS) monitoredAddresses.push(EXTRA_MONITORED_ADDRESS);
-
-  // Deduplicate
   monitoredAddresses = [...new Set(monitoredAddresses)];
   console.log(`📋 Monitoring ${monitoredAddresses.length} addresses.`);
 }
@@ -192,7 +191,6 @@ async function monitorListings() {
     }
 
     for (const tx of allTxs) {
-      // avoid dupes & old epochs quickly
       if (processedTxs.has(tx.tx_hash)) continue;
 
       let blockTime = tx.block_time;
@@ -208,14 +206,13 @@ async function monitorListings() {
         continue;
       }
 
-      // optional epoch filter – keep if you want to ignore very old txs
-      const finalEpoch = getEpoch(blockTime);
+      // optional epoch filter (disabled by default)
+      // const finalEpoch = getEpoch(blockTime);
       // if (finalEpoch < 573) { processedTxs.add(tx.tx_hash); continue; }
 
       const matchingAssets = [];
       for (const output of utxoRes.data.outputs) {
         if (output.address !== address) continue; // incoming to this monitored address
-
         for (const asset of output.amount) {
           if (asset.unit === 'lovelace') continue;
           const policyId = asset.unit.slice(0, 56);
@@ -226,7 +223,7 @@ async function monitorListings() {
       if (matchingAssets.length > 0) {
         const assetDetails = await Promise.all(
           matchingAssets.map(async unit => {
-            await sleep(300);
+            await sleep(250);
             try {
               const res = await axios.get(
                 `https://cardano-mainnet.blockfrost.io/api/v0/assets/${unit}`,
@@ -249,7 +246,7 @@ async function monitorListings() {
 
           const price = meta.price ? `${(meta.price / 1_000_000).toFixed(2)} ADA` : 'N/A';
 
-          // NEW: robust image resolution + gateway rotation
+          // Use the raw image (e.g., 'ipfs://Qm...') and produce a Discord-safe URL
           const raw = extractRawImage(meta);
           const imageUrl = (await ensureImageUrl(raw)) || 'https://via.placeholder.com/600x400?text=No+Image';
 
@@ -265,9 +262,7 @@ async function monitorListings() {
             .setTimestamp();
 
           try {
-            // Optional: log to verify
             console.log({ asset: data.asset, rawImage: raw, imageUrl });
-
             const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
             await channel.send({ embeds: [embed] });
             console.log(`✅ Sent embed for ${assetName}`);
